@@ -59,19 +59,82 @@ def best_ts(e):
 
 
 # ── K8s Client ────────────────────────────────
+def _needs_ssl_skip(kubeconfig_data: str) -> bool:
+    """
+    Return True when the cluster should skip TLS verification. Triggers when:
+      - insecure-skip-tls-verify: true is set, OR
+      - certificate-authority-data is absent, OR
+      - server address is a private/internal IP (self-signed cert, no system CA)
+    """
+    import re as _re
+    _PRIV = _re.compile(
+        r"https?://(10[.]|172[.](1[6-9]|2[0-9]|3[01])[.]|192[.]168[.]|127[.]|localhost)"
+    )
+    try:
+        import yaml
+        kc      = yaml.safe_load(kubeconfig_data) or {}
+        current = kc.get("current-context", "")
+        ctx_obj = next(
+            (c for c in kc.get("contexts", []) if c.get("name") == current), None
+        )
+        if not ctx_obj:
+            return False
+        cname  = (ctx_obj.get("context") or {}).get("cluster", "")
+        cl_cfg = next(
+            (c.get("cluster") or {} for c in kc.get("clusters", [])
+             if c.get("name") == cname),
+            {}
+        )
+        server = cl_cfg.get("server", "")
+        return (
+            bool(cl_cfg.get("insecure-skip-tls-verify", False))
+            or not cl_cfg.get("certificate-authority-data", "")
+            or bool(_PRIV.match(server))
+        )
+    except Exception:
+        return False
+
+
 class K8sClient:
     def __init__(self, kubeconfig_data: str, namespace: str = "default"):
-        self.namespace = namespace
+        self.namespace    = namespace
+        self._skip_tls    = _needs_ssl_skip(kubeconfig_data)
+
+        # Write kubeconfig to a temp file (kubernetes-client requirement)
         self._tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".yaml", delete=False, prefix="k8s_")
         self._tmp.write(kubeconfig_data)
         self._tmp.flush()
         self._tmp_path = self._tmp.name
         self._tmp.close()
+
+        # ── SSL fix ───────────────────────────────────────────────────────
+        # load_kube_config populates the *global* default Configuration.
+        # For self-signed / internal-CA clusters we must patch that config
+        # immediately after loading it and before creating any API clients.
+        # We also suppress urllib3's InsecureRequestWarning to keep logs clean.
+        if self._skip_tls:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
         k8s_config.load_kube_config(config_file=self._tmp_path)
-        self.core       = client.CoreV1Api()
-        self.apps       = client.AppsV1Api()
-        self.networking = client.NetworkingV1Api()
+
+        if self._skip_tls:
+            # Works with kubernetes-client >= 12 (uses thread-local config)
+            cfg = client.Configuration()
+            k8s_config.load_kube_config(
+                config_file=self._tmp_path,
+                client_configuration=cfg,
+            )
+            cfg.verify_ssl  = False
+            cfg.ssl_ca_cert = None
+            api_client = client.ApiClient(configuration=cfg)
+        else:
+            api_client = client.ApiClient()
+
+        self.core       = client.CoreV1Api(api_client=api_client)
+        self.apps       = client.AppsV1Api(api_client=api_client)
+        self.networking = client.NetworkingV1Api(api_client=api_client)
 
     def __del__(self):
         try:
@@ -79,6 +142,21 @@ class K8sClient:
                 os.unlink(self._tmp_path)
         except Exception:
             pass
+
+    def _api_client(self):
+        """Return a per-instance ApiClient that respects SSL setting."""
+        if self._skip_tls:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            cfg = client.Configuration()
+            k8s_config.load_kube_config(
+                config_file=self._tmp_path,
+                client_configuration=cfg,
+            )
+            cfg.verify_ssl  = False
+            cfg.ssl_ca_cert = None
+            return client.ApiClient(configuration=cfg)
+        return client.ApiClient()
 
     def get_cluster_name(self):
         try:
@@ -90,7 +168,7 @@ class K8sClient:
 
     def get_server_version(self):
         try:
-            return client.VersionApi().get_code().git_version
+            return client.VersionApi(api_client=self._api_client()).get_code().git_version
         except Exception:
             return "unknown"
 
