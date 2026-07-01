@@ -95,6 +95,8 @@ Output example:
 The kubeconfig YAML content is stored directly in `clusters.json` under the `kubeconfig_data` key. No file paths. No symlinks. The file can be copied between machines.
 
 ---
+## Demo
+Link: [Click Here](https://drive.google.com/file/d/1n9B8EK7txaJWKWgyIlHxABQ9FWNuqXiH/view?usp=sharing)
 
 ## UI Navigation
 
